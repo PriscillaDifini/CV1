@@ -3,8 +3,12 @@
 Adaptado do tutorial "Document Processing with Gemini" (Google, Apache 2.0).
 
 Fluxo:
-    PDF da decisão -> classificar (sentença, acórdão...) -> extrair campos ->
-    salvar JSON por arquivo (cache) -> planilha com abas Processos/Decisoes/Teses.
+    (autos extensos) -> fatiar em peças (contestação, sentença, acórdão...) ->
+    classificar cada PDF -> extrair decisões ou defesas -> salvar JSON por arquivo
+    (cache) -> planilha com abas Processos/Decisoes/Teses/Defesas/Argumentos.
+
+Os PDFs podem estar numa pasta local/Drive ou num bucket do Cloud Storage
+(caminhos "gs://..."). O acesso a "gs://" exige o cliente da Agent Platform/Vertex.
 
 O livro de códigos (CATALOGO_TESES) fica no topo do arquivo: edite-o para
 incluir as teses que importam no seu acervo. O modelo só pode escolher códigos
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 import time
 from datetime import datetime
 from enum import Enum
@@ -30,8 +35,8 @@ PDF_MIME_TYPE = "application/pdf"
 JSON_MIME_TYPE = "application/json"
 ENUM_MIME_TYPE = "text/x.enum"
 
-# Acima disso, é melhor recortar as páginas da decisão antes de enviar
-# (ver localizar_paginas_decisoes / recortar_pdf).
+# Acima disso, o envio direto de bytes é recusado: use o bucket (gs://)
+# ou fatiar_autos() para separar as peças.
 LIMITE_PDF_BYTES = 18 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
@@ -84,6 +89,8 @@ class TipoDocumento(Enum):
     DECISAO_MONOCRATICA = "decisao_monocratica"
     DECISAO_INTERLOCUTORIA = "decisao_interlocutoria"
     DECISAO_EMBARGOS_DECLARACAO = "decisao_embargos_declaracao"
+    CONTESTACAO = "contestacao"
+    RECURSO = "recurso"
     DESPACHO = "despacho"
     OUTRO = "outro"
 
@@ -96,6 +103,9 @@ TIPOS_DECISORIOS = {
     TipoDocumento.DECISAO_INTERLOCUTORIA,
     TipoDocumento.DECISAO_EMBARGOS_DECLARACAO,
 }
+
+# Peças de defesa: mostram o roteiro completo, inclusive o que o juiz não apreciou.
+TIPOS_DEFESA = {TipoDocumento.CONTESTACAO, TipoDocumento.RECURSO}
 
 
 class Instancia(Enum):
@@ -208,6 +218,80 @@ class DecisaoExtraida(BaseModel):
     )
 
 
+class TipoPeca(Enum):
+    CONTESTACAO = "contestacao"
+    APELACAO = "apelacao"
+    CONTRARRAZOES = "contrarrazoes"
+    AGRAVO = "agravo"
+    EMBARGOS_DECLARACAO = "embargos_declaracao"
+    RECURSO_TRIBUNAL_SUPERIOR = "recurso_tribunal_superior"
+    OUTRA = "outra"
+
+
+class CategoriaArgumento(Enum):
+    PRELIMINAR = "preliminar"
+    PREJUDICIAL_MERITO = "prejudicial_merito"
+    MERITO = "merito"
+    SUBSIDIARIO = "subsidiario"
+
+
+class PosicaoAcordo(Enum):
+    INTERESSE = "interesse"
+    DESINTERESSE = "desinteresse"
+    NAO_MENCIONA = "nao_menciona"
+
+
+class ArgumentoDefesa(BaseModel):
+    categoria: CategoriaArgumento
+    codigo: TeseCodigo = Field(..., description="Código do livro de códigos")
+    descricao_livre: str | None = Field(
+        None, description="Obrigatória se codigo = outra; senão, detalhe opcional"
+    )
+    fundamentos: list[str] = Field(
+        default_factory=list,
+        description="Dispositivos legais, súmulas, temas e precedentes citados para este argumento",
+    )
+    trecho: str | None = Field(
+        None, description="Trecho literal curto (até 300 caracteres) que resume o argumento"
+    )
+
+
+class DefesaExtraida(BaseModel):
+    numero_processo: str | None = Field(
+        None, description="Número CNJ no formato NNNNNNN-DD.AAAA.J.TR.OOOO"
+    )
+    tipo_peca: TipoPeca
+    data_protocolo: str | None = Field(None, description="AAAA-MM-DD")
+    peticionante: str = Field(..., description="Parte que apresenta a peça")
+    peca_da_parte_monitorada: bool = Field(
+        ..., description="true se a peça foi apresentada pela parte monitorada"
+    )
+    escritorio: str | None = Field(None, description="Escritório de advocacia, se constar")
+    advogados: list[str] = Field(default_factory=list, description="Com OAB, se constar")
+    argumentos: list[ArgumentoDefesa] = Field(
+        ..., description="Todos os argumentos, na ordem em que aparecem na peça"
+    )
+    documentos_juntados: list[str] = Field(
+        default_factory=list, description="Documentos mencionados como anexos"
+    )
+    provas_requeridas: list[str] = Field(
+        default_factory=list, description="Ex.: perícia de engenharia, prova testemunhal"
+    )
+    posicao_acordo: PosicaoAcordo
+    pedidos: str = Field(..., description="Síntese dos pedidos finais, até 3 frases")
+    resumo: str = Field(..., description="Linha de defesa em até 3 frases")
+    incertezas: str | None = Field(
+        None, description="Pontos ilegíveis, ambíguos ou que exigem conferência humana"
+    )
+
+
+class Peca(BaseModel):
+    tipo: TipoDocumento
+    pagina_inicial: int = Field(..., description="Página física do PDF, a partir de 1")
+    pagina_final: int
+    descricao: str | None = Field(None, description="Ex.: 'Contestação de XYZ SPE Ltda.'")
+
+
 # ---------------------------------------------------------------------------
 # Instruções ao modelo
 # ---------------------------------------------------------------------------
@@ -219,8 +303,11 @@ Classifique o documento em uma das categorias do esquema.
 - decisao_monocratica: decisão do relator que julga o recurso sozinho.
 - decisao_interlocutoria: decide questão incidental (ex.: tutela de urgência, liminar).
 - decisao_embargos_declaracao: julga embargos de declaração.
+- contestacao: contestação ou defesa do réu (inclui reconvenção na mesma peça).
+- recurso: apelação, contrarrazões, agravo, embargos de declaração opostos pela
+  parte ou recurso aos tribunais superiores (a peça da parte, não o julgamento).
 - despacho: mero impulso, sem conteúdo decisório.
-- outro: petições, certidões e demais documentos."""
+- outro: petição inicial, procurações, certidões, comprovantes e demais documentos."""
 
 
 def instrucao_extracao(parte_monitorada: str, apelidos: list[str]) -> str:
@@ -247,11 +334,40 @@ Regras:
    e use polo "nao_identificado" e resultado "nao_se_aplica"."""
 
 
-PROMPT_PAGINAS = """Este documento são os autos (ou parte dos autos) de um processo judicial.
-Retorne os números das páginas que contêm SENTENÇAS, ACÓRDÃOS, DECISÕES MONOCRÁTICAS
-ou DECISÕES INTERLOCUTÓRIAS relevantes (tutela, liminar), incluindo ementa e voto.
-Ignore petições, procurações, certidões, comprovantes e despachos de mero expediente.
-Use a numeração física das páginas do PDF (a primeira página é 1). Na dúvida, inclua a página."""
+def instrucao_defesa(parte_monitorada: str, apelidos: list[str]) -> str:
+    teses = "\n".join(f"- {k}: {v}" for k, v in CATALOGO_TESES.items())
+    nomes = ", ".join([parte_monitorada, *apelidos])
+    return f"""Você é analista de estratégia processual e mapeia a linha de defesa
+apresentada em peças processuais brasileiras (contestações e recursos).
+
+PARTE MONITORADA: {parte_monitorada}
+Também pode aparecer como: {nomes}. Sociedades de propósito específico (SPE)
+do mesmo grupo contam como parte monitorada.
+
+Regras:
+1. Use apenas o que está na peça. Nunca invente. Sem informação -> null ou lista vazia.
+2. Liste TODOS os argumentos, na ordem da peça, classificando a categoria:
+   preliminar (questões processuais), prejudicial_merito (prescrição, decadência),
+   merito, ou subsidiario (pedidos "caso assim não se entenda").
+3. Use somente estes códigos de tese:
+{teses}
+4. Em "fundamentos", liste leis, súmulas, temas repetitivos e julgados citados.
+5. Em "trecho", copie literalmente uma passagem curta que resuma o argumento.
+6. Datas em AAAA-MM-DD.
+7. Qualquer dúvida, texto ilegível ou ambiguidade vai em "incertezas"."""
+
+
+def prompt_pecas(parte_monitorada: str) -> str:
+    return f"""Este documento são os autos (ou parte dos autos) de um processo judicial.
+Liste as peças relevantes, com a página inicial e a final de cada uma:
+- decisões: sentenças, acórdãos (ementa, relatório e voto), decisões monocráticas,
+  decisões interlocutórias relevantes (tutela, liminar) e decisões em embargos;
+- contestações e recursos (apelação, contrarrazões, agravo, embargos de declaração),
+  principalmente os apresentados por {parte_monitorada} ou por suas SPEs.
+Ignore petição inicial, procurações, certidões, comprovantes, documentos anexos
+e despachos de mero expediente.
+Use a numeração física das páginas do PDF (a primeira página é 1). Na dúvida
+sobre onde a peça termina, inclua a página seguinte."""
 
 
 # ---------------------------------------------------------------------------
@@ -284,20 +400,23 @@ def _com_retentativas(funcao, tentativas: int = 4):
             time.sleep(2 ** (i + 1))
 
 
-def _parte_pdf(pdf_bytes: bytes) -> Part:
-    if len(pdf_bytes) > LIMITE_PDF_BYTES:
+def _parte_pdf(fonte: bytes | str) -> Part:
+    """Aceita os bytes do PDF ou um caminho "gs://bucket/arquivo.pdf"."""
+    if isinstance(fonte, str):
+        return Part.from_uri(file_uri=fonte, mime_type=PDF_MIME_TYPE)
+    if len(fonte) > LIMITE_PDF_BYTES:
         raise ValueError(
-            "PDF grande demais para envio direto. Use localizar_paginas_decisoes() "
-            "e recortar_pdf() para enviar só as páginas da decisão."
+            "PDF grande demais para envio direto. Envie pelo bucket (gs://) ou use "
+            "fatiar_autos() para separar as peças."
         )
-    return Part.from_bytes(data=pdf_bytes, mime_type=PDF_MIME_TYPE)
+    return Part.from_bytes(data=fonte, mime_type=PDF_MIME_TYPE)
 
 
-def classificar_documento(client, model_id: str, pdf_bytes: bytes) -> TipoDocumento:
+def classificar_documento(client, model_id: str, fonte: bytes | str) -> TipoDocumento:
     resposta = _com_retentativas(
         lambda: client.models.generate_content(
             model=model_id,
-            contents=["Classifique o documento a seguir.", _parte_pdf(pdf_bytes)],
+            contents=["Classifique o documento a seguir.", _parte_pdf(fonte)],
             config=GenerateContentConfig(
                 system_instruction=INSTRUCAO_CLASSIFICACAO,
                 response_schema=TipoDocumento,
@@ -312,14 +431,14 @@ def classificar_documento(client, model_id: str, pdf_bytes: bytes) -> TipoDocume
 def extrair_decisao(
     client,
     model_id: str,
-    pdf_bytes: bytes,
+    fonte: bytes | str,
     parte_monitorada: str,
     apelidos: list[str] | None = None,
 ) -> DecisaoExtraida:
     resposta = _com_retentativas(
         lambda: client.models.generate_content(
             model=model_id,
-            contents=["Extraia os dados da decisão judicial a seguir.", _parte_pdf(pdf_bytes)],
+            contents=["Extraia os dados da decisão judicial a seguir.", _parte_pdf(fonte)],
             config=GenerateContentConfig(
                 system_instruction=instrucao_extracao(parte_monitorada, apelidos or []),
                 response_schema=DecisaoExtraida,
@@ -333,20 +452,46 @@ def extrair_decisao(
     return resposta.parsed
 
 
-def localizar_paginas_decisoes(client, model_id: str, pdf_bytes: bytes) -> list[int]:
-    """Para autos completos: devolve as páginas que contêm decisões."""
+def extrair_defesa(
+    client,
+    model_id: str,
+    fonte: bytes | str,
+    parte_monitorada: str,
+    apelidos: list[str] | None = None,
+) -> DefesaExtraida:
     resposta = _com_retentativas(
         lambda: client.models.generate_content(
             model=model_id,
-            contents=["<Documento>", _parte_pdf(pdf_bytes), "</Documento>", PROMPT_PAGINAS],
+            contents=["Mapeie a linha de defesa da peça a seguir.", _parte_pdf(fonte)],
             config=GenerateContentConfig(
-                response_schema=list[int],
+                system_instruction=instrucao_defesa(parte_monitorada, apelidos or []),
+                response_schema=DefesaExtraida,
                 response_mime_type=JSON_MIME_TYPE,
                 temperature=0,
             ),
         )
     )
-    return sorted(set(resposta.parsed or []))
+    if resposta.parsed is None:
+        return DefesaExtraida.model_validate_json(resposta.text)
+    return resposta.parsed
+
+
+def localizar_pecas(client, model_id: str, fonte: bytes | str, parte_monitorada: str) -> list[Peca]:
+    """Lista as peças relevantes (decisões, contestações, recursos) de um PDF de autos."""
+    resposta = _com_retentativas(
+        lambda: client.models.generate_content(
+            model=model_id,
+            contents=["<Documento>", _parte_pdf(fonte), "</Documento>", prompt_pecas(parte_monitorada)],
+            config=GenerateContentConfig(
+                response_schema=list[Peca],
+                response_mime_type=JSON_MIME_TYPE,
+                temperature=0,
+            ),
+        )
+    )
+    pecas = resposta.parsed or []
+    relevantes = TIPOS_DECISORIOS | TIPOS_DEFESA
+    return [p for p in pecas if p.tipo in relevantes and p.pagina_final >= p.pagina_inicial]
 
 
 def recortar_pdf(arquivo_entrada: str | Path, arquivo_saida: str | Path, paginas: list[int]) -> None:
@@ -360,6 +505,153 @@ def recortar_pdf(arquivo_entrada: str | Path, arquivo_saida: str | Path, paginas
 
 
 # ---------------------------------------------------------------------------
+# Cloud Storage
+# ---------------------------------------------------------------------------
+
+
+def _eh_gs(caminho) -> bool:
+    return isinstance(caminho, str) and caminho.startswith("gs://")
+
+
+def _blob(uri: str):
+    from google.cloud import storage  # importado só quando o bucket é usado
+
+    bucket, _, nome = uri.removeprefix("gs://").partition("/")
+    return storage.Client().bucket(bucket).blob(nome)
+
+
+def _listar_pdfs(origem: str | Path) -> list[tuple[str, str | Path]]:
+    """(nome do arquivo, caminho) de cada PDF da origem, sem entrar em subpastas."""
+    if _eh_gs(origem):
+        from google.cloud import storage
+
+        bucket, _, prefixo = origem.removeprefix("gs://").partition("/")
+        prefixo = prefixo.rstrip("/") + "/" if prefixo else ""
+        blobs = storage.Client().list_blobs(bucket, prefix=prefixo, delimiter="/")
+        return sorted(
+            (b.name.rsplit("/", 1)[-1], f"gs://{bucket}/{b.name}")
+            for b in blobs
+            if b.name.lower().endswith(".pdf")
+        )
+    pasta = Path(origem)
+    return sorted((p.name, p) for p in pasta.iterdir() if p.suffix.lower() == ".pdf")
+
+
+def _juntar(origem: str | Path, *partes: str) -> str | Path:
+    if _eh_gs(origem):
+        return "/".join([origem.rstrip("/"), *partes])
+    return Path(origem).joinpath(*partes)
+
+
+def _ler_texto(caminho) -> str | None:
+    if _eh_gs(caminho):
+        blob = _blob(caminho)
+        return blob.download_as_text(encoding="utf-8") if blob.exists() else None
+    caminho = Path(caminho)
+    return caminho.read_text(encoding="utf-8") if caminho.exists() else None
+
+
+def _gravar_texto(caminho, texto: str) -> None:
+    if _eh_gs(caminho):
+        _blob(caminho).upload_from_string(texto, content_type="application/json")
+    else:
+        Path(caminho).parent.mkdir(parents=True, exist_ok=True)
+        Path(caminho).write_text(texto, encoding="utf-8")
+
+
+def _baixar(caminho, destino_local: Path) -> Path:
+    if _eh_gs(caminho):
+        _blob(caminho).download_to_filename(str(destino_local))
+        return destino_local
+    return Path(caminho)
+
+
+def _enviar(arquivo_local: Path, destino) -> None:
+    if _eh_gs(destino):
+        _blob(destino).upload_from_filename(str(arquivo_local), content_type=PDF_MIME_TYPE)
+    else:
+        Path(destino).parent.mkdir(parents=True, exist_ok=True)
+        Path(destino).write_bytes(arquivo_local.read_bytes())
+
+
+# ---------------------------------------------------------------------------
+# Autos extensos: fatiar em peças
+# ---------------------------------------------------------------------------
+
+
+def _unir_pecas_vizinhas(pecas: list[Peca]) -> list[Peca]:
+    """Junta trechos da mesma peça que ficaram divididos entre dois blocos."""
+    unidas: list[Peca] = []
+    for p in sorted(pecas, key=lambda x: x.pagina_inicial):
+        anterior = unidas[-1] if unidas else None
+        if anterior and anterior.tipo == p.tipo and p.pagina_inicial <= anterior.pagina_final + 1:
+            anterior.pagina_final = max(anterior.pagina_final, p.pagina_final)
+        else:
+            unidas.append(p.model_copy())
+    return unidas
+
+
+def fatiar_autos(
+    client,
+    model_id: str,
+    autos: str | Path,
+    destino: str | Path,
+    parte_monitorada: str,
+    paginas_por_bloco: int = 150,
+) -> list[dict]:
+    """Localiza as peças relevantes em autos extensos e grava um PDF por peça em
+    `destino` (pasta local ou gs://), com nomes como
+    "<autos>_03_contestacao_p120-158.pdf". Devolve a lista de peças gravadas.
+
+    Os autos são lidos em blocos de `paginas_por_bloco` páginas, para respeitar
+    os limites do modelo. Confira os recortes antes de processar o lote."""
+    nome_autos = Path(str(autos).rsplit("/", 1)[-1]).stem
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        local = _baixar(autos, tmp / "autos.pdf")
+        leitor = pypdf.PdfReader(str(local))
+        total = len(leitor.pages)
+
+        encontradas: list[Peca] = []
+        for inicio in range(0, total, paginas_por_bloco):
+            fim = min(inicio + paginas_por_bloco, total)
+            bloco = tmp / f"bloco_{inicio + 1}.pdf"
+            escritor = pypdf.PdfWriter()
+            for i in range(inicio, fim):
+                escritor.add_page(leitor.pages[i])
+            escritor.write(str(bloco))
+
+            if _eh_gs(destino):
+                # Na raiz do bucket, para a regra de ciclo de vida de _tmp/ alcançar.
+                bucket = destino.removeprefix("gs://").split("/", 1)[0]
+                uri_bloco = f"gs://{bucket}/_tmp/{nome_autos}_bloco_{inicio + 1}.pdf"
+                _enviar(bloco, uri_bloco)
+                fonte = uri_bloco
+            else:
+                fonte = bloco.read_bytes()
+            try:
+                pecas = localizar_pecas(client, model_id, fonte, parte_monitorada)
+            finally:
+                if _eh_gs(destino):
+                    _blob(uri_bloco).delete()
+
+            for p in pecas:  # converte para a numeração dos autos completos
+                p.pagina_inicial = min(max(p.pagina_inicial, 1), fim - inicio) + inicio
+                p.pagina_final = min(max(p.pagina_final, 1), fim - inicio) + inicio
+            encontradas.extend(pecas)
+            print(f"Páginas {inicio + 1}-{fim} de {total}: {len(pecas)} peça(s)")
+
+        gravadas = []
+        for n, p in enumerate(_unir_pecas_vizinhas(encontradas), 1):
+            nome = f"{nome_autos}_{n:02d}_{p.tipo.value}_p{p.pagina_inicial}-{p.pagina_final}.pdf"
+            arquivo = tmp / nome
+            recortar_pdf(local, arquivo, list(range(p.pagina_inicial, p.pagina_final + 1)))
+            _enviar(arquivo, _juntar(destino, nome))
+            gravadas.append({"arquivo": nome, **p.model_dump(mode="json")})
+    return gravadas
+
+
+# ---------------------------------------------------------------------------
 # Processamento em lote, com cache por arquivo
 # ---------------------------------------------------------------------------
 
@@ -367,46 +659,49 @@ def recortar_pdf(arquivo_entrada: str | Path, arquivo_saida: str | Path, paginas
 def processar_pasta(
     client,
     model_id: str,
-    pasta: str | Path,
+    origem: str | Path,
     parte_monitorada: str,
     apelidos: list[str] | None = None,
     reprocessar: bool = False,
 ) -> list[dict]:
-    """Processa todos os PDFs da pasta. Cada resultado é salvo em
-    <pasta>/_extracoes/<arquivo>.json; numa nova execução, arquivos já
-    processados são lidos do cache (sem custo), salvo se reprocessar=True."""
-    pasta = Path(pasta)
-    pasta_cache = pasta / "_extracoes"
-    pasta_cache.mkdir(exist_ok=True)
-    resultados = []
+    """Processa todos os PDFs de uma pasta local ou de um prefixo gs://.
 
-    pdfs = sorted(pasta.glob("*.pdf")) + sorted(pasta.glob("*.PDF"))
-    for i, caminho in enumerate(pdfs, 1):
-        cache = pasta_cache / f"{caminho.stem}.json"
-        if cache.exists() and not reprocessar:
-            resultados.append(json.loads(cache.read_text(encoding="utf-8")))
-            print(f"[{i}/{len(pdfs)}] {caminho.name}: cache")
+    Decisões vão para "dados"; contestações e recursos, para "defesa". Cada
+    resultado é salvo em <origem>/_extracoes/<arquivo>.json; numa nova execução,
+    arquivos já processados são lidos do cache (sem custo), salvo se
+    reprocessar=True. Com gs://, o cache também fica no bucket."""
+    resultados = []
+    pdfs = _listar_pdfs(origem)
+    for i, (nome, caminho) in enumerate(pdfs, 1):
+        cache = _juntar(origem, "_extracoes", f"{Path(nome).stem}.json")
+        em_cache = None if reprocessar else _ler_texto(cache)
+        if em_cache:
+            resultados.append(json.loads(em_cache))
+            print(f"[{i}/{len(pdfs)}] {nome}: cache")
             continue
 
-        registro = {"arquivo": caminho.name, "status": "ok", "erro": None, "dados": None}
+        registro = {"arquivo": nome, "status": "ok", "erro": None, "dados": None, "defesa": None}
         try:
-            pdf_bytes = caminho.read_bytes()
-            tipo = classificar_documento(client, model_id, pdf_bytes)
+            fonte = caminho if _eh_gs(caminho) else Path(caminho).read_bytes()
+            tipo = classificar_documento(client, model_id, fonte)
             registro["tipo_classificado"] = tipo.value
-            if tipo not in TIPOS_DECISORIOS:
-                registro["status"] = "ignorado"
-            else:
-                dados = extrair_decisao(client, model_id, pdf_bytes, parte_monitorada, apelidos)
+            if tipo in TIPOS_DECISORIOS:
+                dados = extrair_decisao(client, model_id, fonte, parte_monitorada, apelidos)
                 registro["dados"] = dados.model_dump(mode="json")
+            elif tipo in TIPOS_DEFESA:
+                defesa = extrair_defesa(client, model_id, fonte, parte_monitorada, apelidos)
+                registro["defesa"] = defesa.model_dump(mode="json")
+            else:
+                registro["status"] = "ignorado"
         except Exception as erro:  # registra e segue para o próximo arquivo
             registro["status"] = "erro"
             registro["erro"] = f"{type(erro).__name__}: {erro}"
 
         # Erros não vão para o cache, para serem tentados de novo.
         if registro["status"] != "erro":
-            cache.write_text(json.dumps(registro, ensure_ascii=False, indent=2), encoding="utf-8")
+            _gravar_texto(cache, json.dumps(registro, ensure_ascii=False, indent=2))
         resultados.append(registro)
-        print(f"[{i}/{len(pdfs)}] {caminho.name}: {registro['status']}")
+        print(f"[{i}/{len(pdfs)}] {nome}: {registro['status']}")
 
     return resultados
 
@@ -463,7 +758,7 @@ def montar_planilha(
     if caminho_xlsx.exists() and not sobrescrever:
         carimbo = datetime.now().strftime("%Y-%m-%d_%H%M")
         caminho_xlsx = caminho_xlsx.with_name(f"{caminho_xlsx.stem}_{carimbo}{caminho_xlsx.suffix}")
-    decisoes, teses, controle = [], [], []
+    decisoes, teses, defesas, argumentos, controle = [], [], [], [], []
 
     for r in resultados:
         controle.append(
@@ -474,6 +769,8 @@ def montar_planilha(
                 "erro": r.get("erro"),
             }
         )
+        if r.get("defesa"):
+            _registrar_defesa(r["arquivo"], r["defesa"], defesas, argumentos)
         dados = r.get("dados")
         if not dados:
             continue
@@ -542,6 +839,8 @@ def montar_planilha(
         "Processos": df_processos,
         "Decisoes": df_decisoes,
         "Teses": df_teses,
+        "Defesas": pd.DataFrame(defesas),
+        "Argumentos_Defesa": pd.DataFrame(argumentos),
         "Livro_de_Codigos": df_codigos,
         "Controle_Arquivos": pd.DataFrame(controle),
     }
@@ -556,6 +855,58 @@ def montar_planilha(
                 planilha.column_dimensions[coluna[0].column_letter].width = min(max(largura + 2, 10), 60)
     print(f"Planilha salva em {caminho_xlsx}")
     return abas
+
+
+def _registrar_defesa(arquivo: str, defesa: dict, defesas: list, argumentos: list) -> None:
+    id_defesa = len(defesas) + 1
+    numero = normalizar_numero_cnj(defesa.get("numero_processo")) or defesa.get("numero_processo")
+    alertas = []
+    if not validar_numero_cnj(defesa.get("numero_processo")):
+        alertas.append("número CNJ ausente ou inválido")
+    if not defesa.get("peca_da_parte_monitorada"):
+        alertas.append("peça de outra parte")
+    if any(a["codigo"] == "outra" for a in defesa.get("argumentos", [])):
+        alertas.append("argumento fora do catálogo")
+    if defesa.get("incertezas"):
+        alertas.append("modelo registrou incertezas")
+    defesas.append(
+        {
+            "id_defesa": id_defesa,
+            "numero_processo": numero,
+            "arquivo": arquivo,
+            "tipo_peca": defesa["tipo_peca"],
+            "data_protocolo": defesa.get("data_protocolo"),
+            "peticionante": defesa.get("peticionante"),
+            "peca_da_parte_monitorada": defesa.get("peca_da_parte_monitorada"),
+            "escritorio": defesa.get("escritorio"),
+            "advogados": "; ".join(defesa.get("advogados", [])),
+            "qtd_argumentos": len(defesa.get("argumentos", [])),
+            "documentos_juntados": "; ".join(defesa.get("documentos_juntados", [])),
+            "provas_requeridas": "; ".join(defesa.get("provas_requeridas", [])),
+            "posicao_acordo": defesa.get("posicao_acordo"),
+            "pedidos": defesa.get("pedidos"),
+            "resumo": defesa.get("resumo"),
+            "incertezas": defesa.get("incertezas"),
+            "alertas": "; ".join(alertas),
+            "conferido": "NÃO",
+        }
+    )
+    for ordem, a in enumerate(defesa.get("argumentos", []), 1):
+        argumentos.append(
+            {
+                "id_defesa": id_defesa,
+                "numero_processo": numero,
+                "tipo_peca": defesa["tipo_peca"],
+                "peca_da_parte_monitorada": defesa.get("peca_da_parte_monitorada"),
+                "ordem": ordem,
+                "categoria": a["categoria"],
+                "tese": a["codigo"],
+                "descricao_livre": a.get("descricao_livre"),
+                "fundamentos": "; ".join(a.get("fundamentos", [])),
+                "trecho": a.get("trecho"),
+                "conferido": "NÃO",
+            }
+        )
 
 
 def _consolidar_processos(df_decisoes: pd.DataFrame) -> pd.DataFrame:
