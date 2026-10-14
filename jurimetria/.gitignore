@@ -1,0 +1,6 @@
+# Repositório público: nunca versionar peças processuais, extrações ou planilhas.
+*.pdf
+*.PDF
+*.xlsx
+_extracoes/
+processos/
