@@ -60,9 +60,11 @@ Nesse modo, cada PDF enviado precisa ter menos de ~18 MB.
 
 Estrutura sugerida no bucket:
 ```
-gs://SEU-BUCKET/caso-01/autos/   <- PDFs completos, como baixados do eproc
-gs://SEU-BUCKET/caso-01/pecas/   <- gerado pelo notebook: um PDF por peça
+gs://SEU-BUCKET/caso-01/autos/      <- PDFs completos, como baixados do eproc
+gs://SEU-BUCKET/caso-01/pecas/      <- gerado pelo notebook: um PDF por peça
+gs://SEU-BUCKET/caso-01/planilhas/  <- planilha gerada
 ```
+Para baixar a planilha: console do Cloud Storage > bucket > `planilhas` > Baixar.
 """),
     code("""
 # fmt: off
@@ -76,7 +78,8 @@ APELIDOS = ["Cyrela", "Living", "Vivaz"]
 
 PASTA_AUTOS = "gs://SEU-BUCKET/caso-01/autos"  # @param {type: "string"}
 PASTA_PECAS = "gs://SEU-BUCKET/caso-01/pecas"  # @param {type: "string"}
-ARQUIVO_SAIDA = "/content/drive/MyDrive/Jurimetria/banco_cyrela.xlsx"  # @param {type: "string"}
+# No Colab Enterprise o Drive não monta: deixe a planilha no bucket.
+ARQUIVO_SAIDA = "gs://SEU-BUCKET/caso-01/planilhas/banco_cyrela.xlsx"  # @param {type: "string"}
 # fmt: on
 """),
     code("""
@@ -86,11 +89,16 @@ API_KEY = None
 if PROJECT_ID:
     os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT_ID  # usado pelo cliente do Cloud Storage
 if "google.colab" in sys.modules:
-    from google.colab import drive
-    drive.mount("/content/drive")
+    caminhos = (PASTA_AUTOS, PASTA_PECAS, ARQUIVO_SAIDA)
+    if any(c.startswith("/content/drive") for c in caminhos):
+        from google.colab import drive  # só existe no Colab comum, não no Enterprise
+        drive.mount("/content/drive")
     if PROJECT_ID:
         from google.colab import auth
-        auth.authenticate_user()
+        try:
+            auth.authenticate_user()
+        except Exception as erro:  # no Colab Enterprise a sessão já vem autenticada
+            print("Autenticação ignorada:", erro)
     else:
         from google.colab import userdata
         API_KEY = userdata.get("GEMINI_API_KEY")

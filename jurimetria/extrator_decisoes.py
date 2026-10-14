@@ -752,12 +752,15 @@ def _alertas(dados: dict) -> list[str]:
 def montar_planilha(
     resultados: list[dict], caminho_xlsx: str | Path, sobrescrever: bool = False
 ) -> dict[str, pd.DataFrame]:
-    """Gera a planilha. Se o arquivo já existir e sobrescrever=False, salva uma
-    cópia com data e hora no nome, para não apagar uma versão já conferida."""
-    caminho_xlsx = Path(caminho_xlsx)
-    if caminho_xlsx.exists() and not sobrescrever:
+    """Gera a planilha num caminho local ou gs://. Se o arquivo já existir e
+    sobrescrever=False, salva uma cópia com data e hora no nome, para não apagar
+    uma versão já conferida."""
+    destino = str(caminho_xlsx)
+    ja_existe = _blob(destino).exists() if _eh_gs(destino) else Path(destino).exists()
+    if ja_existe and not sobrescrever:
         carimbo = datetime.now().strftime("%Y-%m-%d_%H%M")
-        caminho_xlsx = caminho_xlsx.with_name(f"{caminho_xlsx.stem}_{carimbo}{caminho_xlsx.suffix}")
+        base, _, extensao = destino.rpartition(".")
+        destino = f"{base}_{carimbo}.{extensao}"
     decisoes, teses, defesas, argumentos, controle = [], [], [], [], []
 
     for r in resultados:
@@ -844,7 +847,23 @@ def montar_planilha(
         "Livro_de_Codigos": df_codigos,
         "Controle_Arquivos": pd.DataFrame(controle),
     }
-    with pd.ExcelWriter(caminho_xlsx, engine="openpyxl") as escritor:
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "planilha.xlsx"
+        _gravar_planilha(abas, local)
+        if _eh_gs(destino):
+            _blob(destino).upload_from_filename(
+                str(local),
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            Path(destino).parent.mkdir(parents=True, exist_ok=True)
+            Path(destino).write_bytes(local.read_bytes())
+    print(f"Planilha salva em {destino}")
+    return abas
+
+
+def _gravar_planilha(abas: dict[str, pd.DataFrame], caminho: Path) -> None:
+    with pd.ExcelWriter(caminho, engine="openpyxl") as escritor:
         for nome, df in abas.items():
             df.to_excel(escritor, sheet_name=nome, index=False)
             planilha = escritor.sheets[nome]
@@ -853,8 +872,6 @@ def montar_planilha(
             for coluna in planilha.columns:
                 largura = max((len(str(c.value)) for c in coluna if c.value is not None), default=8)
                 planilha.column_dimensions[coluna[0].column_letter].width = min(max(largura + 2, 10), 60)
-    print(f"Planilha salva em {caminho_xlsx}")
-    return abas
 
 
 def _registrar_defesa(arquivo: str, defesa: dict, defesas: list, argumentos: list) -> None:
